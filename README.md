@@ -33,8 +33,8 @@ Use Python 3.10 or later to run predictions and evaluation. Use Python 3.12 or l
 1. Clone the repository and enter it.
 
    ```sh
-   git clone https://github.com/cruelkratos07/yms-assignment-cruelkratos07.git
-   cd yms-assignment-cruelkratos07
+   git clone https://github.com/cruelkratos07/YMS-Assignment-Divya_Prakash.git
+   cd YMS-Assignment-Divya_Prakash
    ```
 
 2. Install the dependencies if you plan to regenerate features or rebuild the model. You can go straight to the quick start to use the committed files.
