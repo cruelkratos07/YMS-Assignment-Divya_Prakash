@@ -6,7 +6,6 @@ A stock qualifies if its intraday high rises more than 2% above its previous clo
 
 <!-- TODO: Add a build badge when a CI workflow is available. -->
 <!-- TODO: Add a version badge when a release is available. -->
-<!-- TODO: Add a license badge when a license is provided. -->
 
 ## Table of contents
 
@@ -16,7 +15,6 @@ A stock qualifies if its intraday high rises more than 2% above its previous clo
 - [Configuration](#configuration)
 - [Project structure](#project-structure)
 - [Contributing](#contributing)
-- [License](#license)
 
 ## Features
 
@@ -130,7 +128,3 @@ python fit_model.py
 ```
 
 <!-- TODO: Add a contribution policy and unit-test instructions if the repository adopts them. -->
-
-## License
-
-<!-- TODO: Add the license name and link to LICENSE when a license file is provided. -->
