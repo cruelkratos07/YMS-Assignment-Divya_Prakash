@@ -1,0 +1,6 @@
+# Prediction uses only the Python 3.10+ standard library.
+tzdata==2026.6; platform_system == "Windows"
+# Optional model rebuild on Python 3.12+.
+numpy==2.5.4; python_version >= "3.12"
+scikit-learn==1.9.1; python_version >= "3.12"
+threadpoolctl==3.7.0; python_version >= "3.12"
