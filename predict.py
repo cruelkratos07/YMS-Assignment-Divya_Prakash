@@ -3,11 +3,13 @@
 
 import argparse
 from bisect import bisect_left
+from collections import defaultdict
 import csv
+from datetime import datetime, timedelta
 import json
 import math
 from pathlib import Path
-from statistics import median
+from statistics import fmean, median
 
 
 EVENT_FEATURES = ("earnings_released", "earnings_scheduled")
@@ -15,6 +17,7 @@ MODEL_FEATURES = (
     "iv", "iv_relative", "range", "turnover_surprise", *EVENT_FEATURES,
     "india_vix", "us_vix", "es_abs_overnight", "oil_abs_overnight",
     "nikkei_abs_preopen", "hang_seng_abs_preopen", "india_etf_abs_session",
+    "monthly_range_vol", "iv_change", "gap", "adr",
 )
 PRIOR_WEIGHT = 0.35
 MAX_STANDARDIZED_FEATURE = 6.0
@@ -47,7 +50,28 @@ def absolute(row, key):
     return min(abs(value), 10.0) if value is not None else None
 
 
-def daily_features(rows, market, prior_iv=None):
+def monthly_volatility(directory, day, today):
+    """Log daily Parkinson volatility over observed ranges from the last 31 days."""
+    first = (datetime.strptime(day, "%Y%m%d") - timedelta(days=31)).strftime("%Y%m%d")
+    variances = defaultdict(dict)
+
+    def add_ranges(rows):
+        for row in rows:
+            session = row.get("vix_asof") or ""
+            high, low = positive(row, "phi"), positive(row, "plo")
+            if first <= session < day and high and low and high > low:
+                log_range = min(100 * math.log(high / low), 20.0)
+                variances[row["name"]][session] = log_range ** 2 / (4 * math.log(2))
+
+    for path in sorted(directory.glob("*_n50.info.csv")):
+        if first <= path.name[:8] < day:
+            add_ranges(read_csv(path))
+    add_ranges(today)
+    return {name: 0.5 * math.log(fmean(observations.values()))
+            for name, observations in variances.items()}
+
+
+def daily_features(rows, market, prior_iv, range_vol):
     """Build features from the supplied pre-open rows and a strict-prior fallback."""
     prior_iv = prior_iv or {}
     ivs = [positive(row, "vix") or prior_iv.get(row["name"]) for row in rows]
@@ -61,6 +85,9 @@ def daily_features(rows, market, prior_iv=None):
         previous_range = min(100 * (high - low) / close, 20) if good_range else None
         surprise = math.log(turnover / turnover_20) if turnover and turnover_20 else None
         stock_market = market.get(row["name"], {})
+        iv_1m = positive(row, "vix_1m")
+        gap = absolute(stock_market, "india_gap")
+        adr = absolute(stock_market, "adr_session_return")
         result.append({
             "iv": log_scale(iv, 28),
             "iv_relative": log_scale(iv, market_iv) if market_iv else None,
@@ -76,6 +103,10 @@ def daily_features(rows, market, prior_iv=None):
             "hang_seng_abs_preopen": absolute(stock_market, "hang_seng_preopen"),
             "earnings_released": number(stock_market.get("earnings_released")),
             "earnings_scheduled": number(stock_market.get("earnings_scheduled")),
+            "monthly_range_vol": range_vol.get(row["name"]),
+            "iv_change": log_scale(positive(row, "vix"), iv_1m) if iv_1m else None,
+            "gap": min(gap, 4.0) if gap is not None else None,
+            "adr": min(adr, 8.0) if adr is not None else None,
         })
     return result
 
@@ -110,6 +141,7 @@ def prior_risk(features):
         + 0.65 * (features["india_vix"] or 0.0)
         + 0.12 * (features["sp500_abs_return"] or 0.0)
         + 0.65 * overnight
+        + (0.65 * (features["gap"] - 0.6) if features["gap"] is not None else 0.0)
         + 1.45 * (features["earnings_released"] or 0.0)
         + 0.35 * (features["earnings_scheduled"] or 0.0)
     )
@@ -126,11 +158,11 @@ def fitted_risk(features, name, snapshot):
     return (1 - PRIOR_WEIGHT) * score + PRIOR_WEIGHT * prior_risk(features)
 
 
-def predict_day(rows, market, prior_iv, day, model):
+def predict_day(rows, market, prior_iv, range_vol, day, model):
     snapshots = model["snapshots"]
     index = bisect_left([snapshot["as_of"] for snapshot in snapshots], day) - 1
     snapshot = snapshots[index] if index >= 0 else None
-    features = daily_features(rows, market, prior_iv)
+    features = daily_features(rows, market, prior_iv, range_vol)
     scores = (
         [prior_risk(values) for values in features] if snapshot is None else
         [fitted_risk(values, row["name"], snapshot) for row, values in zip(rows, features, strict=True)]
@@ -155,7 +187,8 @@ def main():
     prior_iv = previous_implied_volatility(args.historical_info, args.date, missing_iv) if missing_iv else {}
 
     model = json.loads(Path(__file__).with_name("model.json").read_text(encoding="utf-8"))
-    predictions = predict_day(rows, market, prior_iv, args.date, model)
+    range_vol = monthly_volatility(args.historical_info, args.date, rows)
+    predictions = predict_day(rows, market, prior_iv, range_vol, args.date, model)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     with (args.out_dir / f"{args.date}.predictions.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)

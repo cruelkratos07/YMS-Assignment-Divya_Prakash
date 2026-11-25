@@ -1,26 +1,33 @@
-# Nifty-50 opening risk model
+# Predicting a 2% move before the NSE open
 
-The model flags stocks likely to trade more than 2% away from their previous close in either direction. It blends a ridge-regularized logistic regression with a volatility and earnings risk score. The regression uses absolute and peer-relative stock implied volatility, the prior session's range, turnover relative to its 20-day median, and a regularized offset for each symbol. The blend places 65% weight on the fitted logit and flags a score of 0.55 or higher.
+A stock that moved 1.99% provides different training information from one that moved 0.2%, even though both receive the same binary label. The model uses that distinction. Ridge regression predicts the logarithm of the largest excursion from the previous close, measured in percentage points. At prediction time, the distance from the 2% boundary is scaled by the training residual standard deviation and blended with a fixed volatility and earnings score. The fitted component has weight 0.65. The decision threshold of 0.40 applies to the blended score.
 
-## Market and earnings inputs
+## Features and sources
 
-- The feature CSV uses completed daily bars for India VIX, the S&P 500, Cboe VIX and the US-listed iShares India 50 ETF. The previous Nifty 50 session supplies the anchor for overnight returns and the earnings window. [Yahoo Finance market data](https://finance.yahoo.com/markets/), [iShares INDY](https://www.ishares.com/us/products/239758/ishares-india-50-etf)
-- E-mini S&P 500 and Brent returns run from the previous NSE close to the latest usable pre-open bar. Nikkei and Hang Seng returns run from the previous Asian session to the pre-open bar. An hourly quote enters the CSV only if its full one-hour window ends by 09:05 IST. An absent quote stays blank. [CME E-mini S&P 500 futures](https://www.cmegroup.com/markets/equities/sp/e-mini-sandp500.html)
-- The earnings-release flag covers financial results disseminated by NSE between the previous NSE close and 09:15 IST. A scheduled results meeting is eligible when its exchange notice was public before the prediction cutoff. [NSE announcements](https://www.nseindia.com/companies-listing/corporate-filings-announcements), [NSE board meeting notices](https://www.nseindia.com/companies-listing/corporate-filings-board-meetings)
+- **Stock volatility.** Inputs include implied volatility, its ratio to its one-month average, the stock's volatility relative to peers, the previous range and turnover relative to its 20-day median. A 31-calendar-day estimate uses Parkinson's daily variance, `log(high / low)² / (4 log 2)`, averaged over available prior ranges. Each as-of date counts once. This adapts the different horizons in Corsi's volatility model to a panel with missing sessions. Kambouroudis and colleagues also studied implied volatility and overnight returns in this setting. [Parkinson (1980)](https://www.cmegroup.com/trading/fx/files/michael_parkinson.pdf) · [Corsi (2009)](https://doi.org/10.1093/jjfinec/nbp001) · [Kambouroudis et al. (2021)](https://doi.org/10.1002/fut.22241)
+- **Overnight price discovery.** India equity funds trade in Tokyo and Hong Kong before the NSE opens. Each available fund price is converted to rupees and scaled to the Nifty using up to three recent sessions when both markets traded. The median implied change from the previous Nifty close supplies a market-wide gap estimate. For five dual-listed stocks, a separate feature measures the return of their US depositary receipt while India's cash market was closed. Fund tracking differences and sparse quotes introduce uncertainty into the gap estimate. [Ou (2023)](https://doi.org/10.1080/10293523.2023.2208904) · [Tokyo Nifty 50 ETF](https://nextfunds.jp/en/lineup/1678/) · [Hong Kong SENSEX ETF](https://www.blackrock.com/hk/en/products/251590/)
+- **Information cutoff.** The other market inputs include India VIX, US volatility, stock-index futures, Brent and Asian indexes. Hourly bars enter only after their full hour has ended, with a cutoff of 09:05 IST. Daily bars use earlier exchange dates. NSE earnings flags use the exchange dissemination time for released results and the notice timestamp for scheduled meetings, both strictly before 09:15 IST. Missing regression inputs take their training median. [Yahoo Finance](https://finance.yahoo.com/markets/) · [NSE announcements](https://www.nseindia.com/companies-listing/corporate-filings-announcements) · [NSE board meetings](https://www.nseindia.com/companies-listing/corporate-filings-board-meetings)
 
-## Validation and timing
+## Model selection
 
-I compared stock-only, market and overnight feature sets using expanding windows of whole training dates. Each fit uses earlier training dates with usable stock volatility. The model refits every two training dates after an eight-date warm-up. I chose the threshold for the grader's precision-weighted score and checked the quieter June–October training period. The selected setup reached **80.43% precision, 29.91% recall and 0.7520 score** across 3,050 expanding-window validation rows. Precision was **64.71%** in the June–October subset, where recall fell to **6.88%**.
+The comparison used expanding windows of whole training dates. After an eight-date warm-up, coefficients were refitted every two training dates using earlier sessions with usable implied volatility. Validation used the same 61 eligible dates for each model. The richer target and additional features improved the precision-weighted score while lowering precision. Among decision thresholds of 0.25, 0.40 and 0.55, the selected threshold gave the highest score for the revised model with at least 75% precision overall and over 60% in June–October.
 
-The test split was excluded from feature selection, fitting and threshold selection. For date D, prediction selects a snapshot whose last eligible training date is strictly before D. Before the first snapshot, the volatility and earnings risk score drives the decision. If a practice row has masked implied volatility, prediction can use the most recent supplied earlier volatility. Other unavailable regression inputs map to the fitted training median. At runtime the program uses the supplied CSVs and the committed coefficients with no network requests.
+| Training-date validation | Rows | Precision | Recall | Score |
+|---|---:|---:|---:|---:|
+| Previous binary model | 3,050 | 80.43% | 29.91% | 0.7520 |
+| Excursion model | 3,050 | 75.86% | 37.59% | 0.7776 |
+| Excursion model, June–October only | 2,050 | 61.96% | 8.91% | 0.4989 |
 
-## Reproduce
+These rows were used for model selection. The June–October subset shows how much recall fell in calmer sessions. The earlier submission had already been graded on the official test set. The revision used the released training labels for all fits and comparisons, and its model and threshold were frozen before the repeat test run.
+
+## Reproduction
 
 ```sh
 python -m pip install -r requirements.txt
 python prepare_user_historical_info.py
 python fit_model.py
 python evaluator/run_evaluation.py .
+python evaluator/run_evaluation.py . --data evaluator/data
 ```
 
-Python 3.12 or later is required to rebuild the fitted model. The committed feature CSV and coefficients support offline evaluation, including after historical hourly bars age out of the source API.
+Prediction runs offline with the committed feature CSV and model. For each date it selects the last snapshot fitted strictly before that date. During warm-up it uses the fixed score. Rebuilding the model requires Python 3.12 or later. Rebuilding the feature CSV requires access to the data providers and their historical hourly bars.

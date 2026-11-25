@@ -7,25 +7,26 @@ import json
 from pathlib import Path
 
 import numpy as np
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import Ridge
 from threadpoolctl import threadpool_limits
 
 from predict import (
     EVENT_FEATURES, MAX_STANDARDIZED_FEATURE, MODEL_FEATURES,
-    daily_features, fitted_risk, positive, read_csv,
+    daily_features, fitted_risk, monthly_volatility, positive, read_csv,
 )
-from test_predictions import load_labels, score
+from test_predictions import parse_bool, score
 
 
 WARMUP_DATES = 8
 REFIT_EVERY = 2
-REGULARIZATION_C = 0.12
+RIDGE_PENALTY = 100 / 3
 STOCK_SCALE = 0.65
-THRESHOLD = 0.55
+THRESHOLD = 0.40
 
 
 def load_training(data, feature_csv):
-    labels = load_labels(data / "train_labels.csv")
+    labels = {(r["date"], r["name"]): (float(r["max_move_pct"]), parse_bool(r["moved"]))
+              for r in read_csv(data / "train_labels.csv")}
     date_blocks = sorted({date for date, _ in labels})
     markets = {day: {} for day in date_blocks}
     with feature_csv.open(newline="", encoding="utf-8") as stream:
@@ -39,7 +40,9 @@ def load_training(data, feature_csv):
         fresh_iv = {row["name"]: iv for row in rows
                     if (iv := positive(row, "vix")) is not None}
         complete_day = len(fresh_iv) >= 0.9 * len(rows)
-        for row, values in zip(rows, daily_features(rows, markets[day], prior_iv), strict=True):
+        range_vol = monthly_volatility(data / "historical_info", day, rows)
+        day_features = daily_features(rows, markets[day], prior_iv, range_vol)
+        for row, values in zip(rows, day_features, strict=True):
             dates.append(index)
             names.append(row["name"])
             features.append(values)
@@ -47,10 +50,12 @@ def load_training(data, feature_csv):
         prior_iv.update(fresh_iv)
 
     target = [labels[date_blocks[index], name] for index, name in zip(dates, names, strict=True)]
-    return date_blocks, np.array(dates), np.array(names), features, np.array(complete), np.array(target)
+    moves, binary = zip(*target)
+    return (date_blocks, np.array(dates), np.array(names), features, np.array(complete),
+            np.log(np.maximum(moves, 0.05)), np.array(binary))
 
 
-def fit_snapshots(date_blocks, dates, names, features, complete, target):
+def fit_snapshots(date_blocks, dates, names, features, complete, log_moves, target):
     x = np.array([[row[key] for key in MODEL_FEATURES] for row in features], dtype=float)
     symbols = np.unique(names)
     stock_vectors = STOCK_SCALE * (names[:, None] == symbols)
@@ -58,8 +63,11 @@ def fit_snapshots(date_blocks, dates, names, features, complete, target):
     validation = {}
     for first in range(WARMUP_DATES, len(date_blocks) + 1, REFIT_EVERY):
         fit_rows = (dates < first) & complete
-        centers = np.nanmedian(x[fit_rows], axis=0)
-        scales = np.maximum(np.nanstd(x[fit_rows], axis=0), 0.05)
+        train_x = x[fit_rows]
+        available = np.isfinite(train_x).any(axis=0)
+        centers, scales = np.zeros(x.shape[1]), np.ones(x.shape[1])
+        centers[available] = np.nanmedian(train_x[:, available], axis=0)
+        scales[available] = np.maximum(np.nanstd(train_x[:, available], axis=0), 0.05)
         for j, key in enumerate(MODEL_FEATURES):
             if key in EVENT_FEATURES:
                 scales[j] = 0.4
@@ -69,11 +77,14 @@ def fit_snapshots(date_blocks, dates, names, features, complete, target):
         )
         model_input = np.column_stack((standardized, stock_vectors[fit_rows]))
         with threadpool_limits(limits=1):
-            fit = LogisticRegression(C=REGULARIZATION_C, max_iter=700).fit(model_input, target[fit_rows])
-        weights = fit.coef_[0]
+            fit = Ridge(alpha=RIDGE_PENALTY).fit(model_input, log_moves[fit_rows])
+        # Express distance from the 2% boundary in residual standard deviations.
+        residuals = log_moves[fit_rows] - fit.predict(model_input)
+        score_scale = 1.65 / max(float(np.std(residuals)), 1e-6)
+        weights = fit.coef_ * score_scale
         snapshot = {
             "as_of": date_blocks[first - 1],
-            "intercept": float(fit.intercept_[0]),
+            "intercept": float((fit.intercept_ - np.log(2.0)) * score_scale),
             "centers": centers.tolist(),
             "scales": scales.tolist(),
             "weights": weights[:len(MODEL_FEATURES)].tolist(),

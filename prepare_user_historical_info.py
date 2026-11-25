@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build date/name rows with market features from completed daily closes."""
+"""Build the pre-open feature file from exchange notices and completed price bars."""
 
 import argparse
 from bisect import bisect_left, bisect_right
@@ -11,11 +11,14 @@ import json
 import math
 from pathlib import Path
 import re
+from tempfile import NamedTemporaryFile
 import time
 from urllib.error import URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
+
+from overnight import ADR_SYMBOLS, GAP_MARKETS, adr_session_move, estimate_gap
 
 
 SYMBOLS = {
@@ -228,23 +231,40 @@ def main():
         key: CloseHistory(daily_bars(symbol, start, end))
         for key, symbol in SYMBOLS.items()
     }
-    hourly = {
-        key: HourlyHistory(symbol, dates[0] - timedelta(days=8), end)
-        for key, symbol in HOURLY_SYMBOLS.items()
-    }
+    def hourly_history(item):
+        key, symbol = item
+        # Use enough prior bars to establish ETF/currency parity on exchange holidays.
+        first = start if key in GAP_MARKETS else dates[0] - timedelta(days=8)
+        return key, HourlyHistory(symbol, first, end)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        hourly = dict(pool.map(hourly_history, (HOURLY_SYMBOLS | GAP_MARKETS).items()))
+    adrs = {name: CloseHistory(daily_bars(symbol, start, end))
+            for name, symbol in ADR_SYMBOLS.items() if name in names}
     earnings = EarningsHistory(set(names), dates[0] - timedelta(days=8), dates[-1])
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    with args.out.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.writer(stream)
-        writer.writerow(("date", "name", *FEATURES, *EVENT_FEATURES))
-        for day in dates:
-            values = tuple(f"{value:.6f}" if value is not None else ""
-                           for value in market_features(day, histories, hourly))
-            previous_india = histories["nifty"].days[histories["nifty"].before(day)]
-            writer.writerows(
-                (day.strftime("%Y%m%d"), name, *values, *earnings.features(day, previous_india, name))
-                for name in names
-            )
+    def formatted(value):
+        return f"{value:.6f}" if value is not None else ""
+
+    temp_path = None
+    try:
+        with NamedTemporaryFile(mode="w", dir=args.out.parent, newline="", encoding="utf-8",
+                                delete=False) as stream:
+            temp_path = Path(stream.name)
+            writer = csv.writer(stream)
+            writer.writerow(("date", "name", *FEATURES, *EVENT_FEATURES, "india_gap", "adr_session_return"))
+            for day in dates:
+                values = tuple(map(formatted, market_features(day, histories, hourly)))
+                previous_india = histories["nifty"].days[histories["nifty"].before(day)]
+                gap = formatted(estimate_gap(day, histories["nifty"], hourly))
+                for name in names:
+                    adr = adr_session_move(adrs[name], previous_india, day) if name in adrs else None
+                    events = earnings.features(day, previous_india, name)
+                    writer.writerow((day.strftime("%Y%m%d"), name, *values, *events, gap, formatted(adr)))
+        temp_path.replace(args.out)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
     print(f"Wrote {len(dates)} dates × {len(names)} stocks to {args.out}")
 
 
